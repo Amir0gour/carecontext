@@ -319,8 +319,8 @@ export const HomeSensorMap: React.FC<HomeSensorMapProps> = ({
         {/* Live Manual Sensor Simulator Buttons */}
         <div>
           <div className="text-xs font-semibold text-stone-400 mb-2 flex items-center justify-between">
-            <span>Simulate Sensor Event in Eleanor&apos;s Home:</span>
-            <span className="text-[11px] text-stone-400">Updates live telemetry</span>
+            <span>Simulate Sensor Event in {homeState.userName}&apos;s Home:</span>
+            <span className="text-[11px] text-stone-400">Updates live telemetry (offline & Netlify ready)</span>
           </div>
           <div className="flex flex-wrap gap-2">
             <button

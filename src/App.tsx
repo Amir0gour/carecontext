@@ -32,27 +32,17 @@ import type {
   McpToolCall,
   ScheduleItem,
 } from './types/careContext.ts';
+import {
+  INITIAL_HOME_STATE,
+  loadClientHomeState,
+  saveClientHomeState,
+  applyScenarioToState,
+  applySensorTriggerToState,
+  getEffectiveTime,
+} from './utils/clientState.ts';
+import { executeClientAgentConversation } from './utils/clientAgent.ts';
 
-const DEFAULT_STATE: HomeState = {
-  currentScenario: 'kitchen_routine',
-  userName: 'Eleanor',
-  userAge: 81,
-  homeAddress: '742 Evergreen Terrace, Portland, OR',
-  caregiverName: 'Sarah Miller',
-  caregiverPhone: '+1 (555) 234-8901',
-  caregiverRelationship: 'Daughter / Primary Caregiver',
-  currentTime: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-  useLiveTime: true,
-  currentRoom: 'Kitchen',
-  wakeTimeEstimated: '06:15 AM',
-  routineBaselineWake: '07:00 AM',
-  safetyState: 'normal',
-  sensors: [],
-  events: [],
-  schedule: [],
-  alerts: [],
-  mcpLogs: [],
-};
+const DEFAULT_STATE: HomeState = INITIAL_HOME_STATE;
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'alexa' | 'sensors' | 'schedule' | 'caregiver' | 'mcp'>('alexa');
@@ -83,17 +73,22 @@ export default function App() {
     "What's on my schedule for today?",
   ]);
 
-  // Fetch initial home state from backend
+  // Fetch initial home state from backend or local storage
   const fetchState = useCallback(async () => {
     try {
       const res = await fetch('/api/state');
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
+        return;
       }
     } catch (err) {
-      console.warn('Failed to fetch home state:', err);
+      // Backend not running (e.g. Netlify static deploy)
     }
+    // Fallback to local storage or defaults
+    const local = loadClientHomeState();
+    setHomeState(local);
   }, []);
 
   useEffect(() => {
@@ -125,20 +120,32 @@ export default function App() {
         content: m.content,
       }));
 
-      const res = await fetch('/api/mcp/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...payload,
-          history: historyPayload,
-        }),
-      });
+      // Try server endpoint first
+      let data: any = null;
+      try {
+        const res = await fetch('/api/mcp/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload,
+            history: historyPayload,
+          }),
+        });
 
-      if (!res.ok) {
-        throw new Error(`Agent request failed: ${res.statusText}`);
+        if (res.ok) {
+          data = await res.json();
+        }
+      } catch (networkErr) {
+        // Backend not available (Netlify, static hosting)
       }
 
-      const data = await res.json();
+      // If backend responded with 404/500/offline, use client agent execution
+      if (!data || !data.text) {
+        data = executeClientAgentConversation(homeState, {
+          ...payload,
+          history: historyPayload,
+        });
+      }
 
       const assistantMsg: AgentChatMessage = {
         id: `asst-${Date.now()}`,
@@ -154,6 +161,7 @@ export default function App() {
       setMessages((prev) => [...prev, assistantMsg]);
       if (data.homeState) {
         setHomeState(data.homeState);
+        saveClientHomeState(data.homeState);
       }
       if (data.suggestedReplies) {
         setSuggestedReplies(data.suggestedReplies);
@@ -182,6 +190,10 @@ export default function App() {
   };
 
   const handleSelectScenario = async (scenarioKey: string) => {
+    // Optimistic / fallback client state
+    const nextState = applyScenarioToState(homeState, scenarioKey);
+    setHomeState(nextState);
+
     try {
       const res = await fetch('/api/scenario', {
         method: 'POST',
@@ -191,13 +203,18 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn(e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleTriggerSensor = async (sensorId: string, eventType: string, detail?: string) => {
+    // Optimistic / fallback client state
+    const nextState = applySensorTriggerToState(homeState, sensorId, eventType, detail);
+    setHomeState(nextState);
+
     try {
       const res = await fetch('/api/sensors/trigger', {
         method: 'POST',
@@ -207,13 +224,30 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn(e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleToggleScheduleItem = async (itemId: string, completed: boolean) => {
+    // Optimistic client update
+    const updatedSchedule = homeState.schedule.map((item) => {
+      if (item.id === itemId) {
+        const isDone = completed !== undefined ? completed : !item.isCompleted;
+        return {
+          ...item,
+          isCompleted: isDone,
+          completedAt: isDone ? getEffectiveTime(homeState) : undefined,
+        };
+      }
+      return item;
+    });
+    const nextState: HomeState = { ...homeState, schedule: updatedSchedule };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const res = await fetch('/api/schedule/toggle', {
         method: 'POST',
@@ -223,9 +257,10 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn(e);
+      // Backend unavailable, client state is already updated
     }
   };
 
@@ -239,6 +274,13 @@ export default function App() {
     useLiveTime?: boolean;
     currentTime?: string;
   }) => {
+    const nextState: HomeState = {
+      ...homeState,
+      ...profile,
+    };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const res = await fetch('/api/user-profile', {
         method: 'POST',
@@ -248,13 +290,33 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn('Failed to save profile:', e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleSaveScheduleItem = async (item: Partial<ScheduleItem>) => {
+    let nextSchedule = [...homeState.schedule];
+    if (item.id) {
+      nextSchedule = nextSchedule.map((s) => (s.id === item.id ? ({ ...s, ...item } as ScheduleItem) : s));
+    } else {
+      const newItem: ScheduleItem = {
+        id: `sched-${Date.now()}`,
+        time: item.time || '09:00 AM',
+        title: item.title || 'New Item',
+        category: item.category || 'activity',
+        details: item.details || '',
+        isCompleted: false,
+        isCritical: item.isCritical || false,
+      };
+      nextSchedule.push(newItem);
+    }
+    const nextState: HomeState = { ...homeState, schedule: nextSchedule };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const endpoint = item.id ? '/api/schedule/update' : '/api/schedule/add';
       const res = await fetch(endpoint, {
@@ -265,13 +327,19 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn('Failed to save schedule item:', e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleDeleteScheduleItem = async (itemId: string) => {
+    const nextSchedule = homeState.schedule.filter((s) => s.id !== itemId);
+    const nextState: HomeState = { ...homeState, schedule: nextSchedule };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const res = await fetch('/api/schedule/delete', {
         method: 'POST',
@@ -281,13 +349,29 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn('Failed to delete schedule item:', e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleRespondAlert = async (alertId: string, replyText: string) => {
+    const updatedAlerts = homeState.alerts.map((a) => {
+      if (a.id === alertId) {
+        return {
+          ...a,
+          status: 'Caregiver Responded' as const,
+          caregiverResponseText: replyText || "I'm 5 minutes away, Mom! Calling your Alexa right now.",
+          responseTime: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        };
+      }
+      return a;
+    });
+    const nextState: HomeState = { ...homeState, alerts: updatedAlerts };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const res = await fetch('/api/alerts/respond', {
         method: 'POST',
@@ -297,13 +381,18 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn(e);
+      // Backend unavailable, client state is already updated
     }
   };
 
   const handleClearAlerts = async () => {
+    const nextState: HomeState = { ...homeState, alerts: [], safetyState: 'normal' };
+    setHomeState(nextState);
+    saveClientHomeState(nextState);
+
     try {
       const res = await fetch('/api/alerts/clear', {
         method: 'POST',
@@ -312,9 +401,10 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setHomeState(data);
+        saveClientHomeState(data);
       }
     } catch (e) {
-      console.warn(e);
+      // Backend unavailable, client state is already updated
     }
   };
 
