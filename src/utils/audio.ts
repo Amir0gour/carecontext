@@ -2,6 +2,8 @@
 // SSR-safe: all browser APIs are strictly guarded
 
 let audioCtx: AudioContext | null = null;
+let selectedVoice: SpeechSynthesisVoice | null = null;
+let voiceInitialized = false;
 
 function isBrowser(): boolean {
   return typeof window !== 'undefined' && typeof document !== 'undefined';
@@ -99,42 +101,161 @@ export function playEmergencyAlertChime() {
   }
 }
 
+export function playSensorChime() {
+  if (!isBrowser()) return;
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(659.25, now);
+    osc.frequency.exponentialRampToValueAtTime(880, now + 0.08);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.08, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.2);
+  } catch (e) {
+    // Graceful fallback
+  }
+}
+
+
+/**
+ * Finds and locks to ONE consistent female Alexa-style voice throughout the entire session.
+ * Eliminates voice-switching between initial male voice and later female voice.
+ */
+export function findConsistentVoice(): SpeechSynthesisVoice | null {
+  if (!isBrowser() || !window.speechSynthesis) return null;
+  if (selectedVoice) return selectedVoice;
+
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || voices.length === 0) return null;
+
+  // 1. First priority: Warm, friendly female voices common across platforms
+  const femaleKeywords = ['samantha', 'victoria', 'karen', 'zira', 'jenny', 'aria', 'female', 'natural'];
+  const femaleVoice = voices.find((v) => {
+    if (!v.lang.startsWith('en')) return false;
+    const lower = v.name.toLowerCase();
+    return femaleKeywords.some((kw) => lower.includes(kw));
+  });
+
+  if (femaleVoice) {
+    selectedVoice = femaleVoice;
+    voiceInitialized = true;
+    return femaleVoice;
+  }
+
+  // 2. Second priority: Standard English Google or Apple voice
+  const googleOrApple = voices.find(
+    (v) => v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Apple') || v.name.includes('Natural'))
+  );
+  if (googleOrApple) {
+    selectedVoice = googleOrApple;
+    voiceInitialized = true;
+    return googleOrApple;
+  }
+
+  // 3. Third priority: First English voice
+  const anyEnglish = voices.find((v) => v.lang.startsWith('en'));
+  if (anyEnglish) {
+    selectedVoice = anyEnglish;
+    voiceInitialized = true;
+    return anyEnglish;
+  }
+
+  // 4. Fallback to first voice
+  if (voices[0]) {
+    selectedVoice = voices[0];
+    voiceInitialized = true;
+    return voices[0];
+  }
+
+  return null;
+}
+
+// Pre-register voice listener so voices are resolved as early as possible
+if (isBrowser() && window.speechSynthesis) {
+  findConsistentVoice();
+  if (typeof window.speechSynthesis.onvoiceschanged !== 'undefined') {
+    window.speechSynthesis.onvoiceschanged = () => {
+      findConsistentVoice();
+    };
+  }
+}
+
+export function getCurrentVoiceLabel(): string {
+  const v = selectedVoice || findConsistentVoice();
+  if (v) {
+    return `${v.name} (${v.lang})`;
+  }
+  return 'Alexa Voice (Female, Warm)';
+}
+
 export function speakText(text: string, onEnd?: () => void) {
   if (!isBrowser() || !window.speechSynthesis) {
     if (onEnd) onEnd();
     return;
   }
 
-  try {
-    // Cancel any ongoing speech
-    window.speechSynthesis.cancel();
+  const executeSpeech = () => {
+    try {
+      // Cancel any ongoing speech
+      window.speechSynthesis.cancel();
 
-    const cleanText = text.replace(/[*#_~`]/g, '');
-    const utterance = new SpeechSynthesisUtterance(cleanText);
+      const cleanText = text.replace(/[*#_~`]/g, '');
+      const utterance = new SpeechSynthesisUtterance(cleanText);
 
-    // Pick a warm, friendly voice if available
-    const voices = window.speechSynthesis.getVoices();
-    const warmVoice =
-      voices.find((v) => v.lang.startsWith('en') && (v.name.includes('Samantha') || v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Victoria') || v.name.includes('Karen') || v.name.includes('Zira'))) ||
-      voices.find((v) => v.lang.startsWith('en')) ||
-      null;
+      // Lock to consistent voice
+      const voice = selectedVoice || findConsistentVoice();
+      if (voice) {
+        utterance.voice = voice;
+      }
+      utterance.pitch = 1.05;
+      utterance.rate = 0.95; // Slightly slower, calm cadence suitable for elder care
 
-    if (warmVoice) {
-      utterance.voice = warmVoice;
+      utterance.onend = () => {
+        if (onEnd) onEnd();
+      };
+      utterance.onerror = () => {
+        if (onEnd) onEnd();
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      if (onEnd) onEnd();
     }
-    utterance.pitch = 1.05;
-    utterance.rate = 0.95; // Slightly slower, calm cadence suitable for elder care
+  };
 
-    utterance.onend = () => {
-      if (onEnd) onEnd();
-    };
-    utterance.onerror = () => {
-      if (onEnd) onEnd();
+  // Guard against browser voice async load latency:
+  // If voices have not populated yet, wait for voiceschanged or a short delay
+  // so the first speech NEVER falls back to an unwanted male default voice!
+  if (!selectedVoice && window.speechSynthesis.getVoices().length === 0) {
+    let triggered = false;
+    const voiceHandler = () => {
+      if (!triggered) {
+        triggered = true;
+        findConsistentVoice();
+        executeSpeech();
+      }
     };
 
-    window.speechSynthesis.speak(utterance);
-  } catch (err) {
-    if (onEnd) onEnd();
+    window.speechSynthesis.onvoiceschanged = voiceHandler;
+
+    // Timeout safety fallback (max 200ms)
+    setTimeout(() => {
+      if (!triggered) {
+        triggered = true;
+        findConsistentVoice();
+        executeSpeech();
+      }
+    }, 200);
+  } else {
+    executeSpeech();
   }
 }
 

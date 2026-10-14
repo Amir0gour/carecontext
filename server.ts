@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { GoogleGenAI } from '@google/genai';
 import {
   BedrockRuntimeClient,
   ConverseCommand,
@@ -21,6 +22,26 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
+
+// Google GenAI (Gemini) Client
+let geminiAi: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  if (!geminiAi && process.env.GEMINI_API_KEY) {
+    try {
+      geminiAi = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+    } catch (e) {
+      console.warn('Gemini client initialization error:', e);
+    }
+  }
+  return geminiAi;
+}
 
 // In-Memory Simulated Home & Ring Sensor State
 let state: HomeState = {
@@ -546,7 +567,7 @@ Rules:
 1. For morning check-ins, execute get_ring_sensor_data silently before greeting the user.
 2. Deducing context from sensors, greet the user warmly and naturally by their name (${name}) (e.g., 'I noticed you were up early in the kitchen...'). Never recite raw sensor metrics or timestamps.
 3. Query get_daily_schedule and weave medication and hydration reminders casually into conversation.
-4. If the user indicates distress or unresponsiveness, run a simple Yes/No safety check. Escalate immediately via alert_family_contact if confirmed or unanswered within 30 seconds.
+4. If the user indicates distress, run a reassuring Yes/No safety check. Never force emergency dispatch while resting or sleeping. If emergency SOS is requested or confirmed, escalate immediately via alert_family_contact.
 5. Answer any question ${name} asks directly, warmly, and knowledgeably (e.g., about home sensors, front door locks, schedule items, real-time clock, doctor visits, weather, caregiver ${caregiver}, jokes, or health). Never repeat previously used phrases or greetings.
 6. If the user asks to change their name or update schedule items, acknowledge the change warmly.
 Tone: Warm, calm, patient, companionable.`;
@@ -613,7 +634,7 @@ async function executeAgentConversation({
   history,
 }: {
   message?: string;
-  triggerType?: 'morning_checkin' | 'user_speech' | 'safety_response' | 'unresponsive_timeout';
+  triggerType?: 'morning_checkin' | 'user_speech' | 'safety_response' | 'unresponsive_timeout' | 'emergency_sos';
   safetyAnswer?: 'yes' | 'no';
   history?: Array<{ role: string; content: string }>;
 }) {
@@ -623,20 +644,22 @@ async function executeAgentConversation({
   let nextSafetyState: 'normal' | 'verifying_safety' | 'emergency_dispatched' = state.safetyState;
   let dynamicReplies: string[] = [];
 
-  // Rule 4: Check if unresponsiveness or confirmed emergency
-  if (triggerType === 'unresponsive_timeout' || (triggerType === 'safety_response' && safetyAnswer === 'no')) {
-    thought = 'User confirmed distress or remained unresponsive during safety check. Escalating immediately via alert_family_contact to Sarah Miller.';
+  // Rule 4: Check if Emergency SOS, unresponsiveness, or confirmed emergency
+  if (triggerType === 'emergency_sos' || triggerType === 'unresponsive_timeout' || (triggerType === 'safety_response' && safetyAnswer === 'no')) {
+    thought = triggerType === 'emergency_sos'
+      ? 'Emergency SOS requested directly by user. Escalating immediately via alert_family_contact to Sarah Miller.'
+      : 'User confirmed distress or requested emergency escalation. Escalating immediately via alert_family_contact to Sarah Miller.';
     const alertResult = mcpAlertFamilyContact(
-      triggerType === 'unresponsive_timeout'
-        ? `No response from ${state.userName} after 30-second morning check-in safety alert`
-        : `${state.userName} indicated they need help or are not okay in the ${state.currentRoom}`,
+      triggerType === 'emergency_sos'
+        ? `Emergency SOS triggered directly by ${state.userName} in the ${state.currentRoom}`
+        : `${state.userName} indicated they need help or are in distress in the ${state.currentRoom}`,
       'urgent',
       `Home telemetry: ${state.currentRoom} activity. Emergency dispatch initiated.`
     );
     const toolLog = recordMcpCall('alert_family_contact', { reason: alertResult.messageBody, severity: 'urgent' }, alertResult);
     toolCallsExecuted.push(toolLog);
     nextSafetyState = 'emergency_dispatched';
-    responseText = `I'm sending a quick message to Sarah right now to let her know to check in on you, Eleanor. Please sit down comfortably and take slow, easy breaths. Help is on the way.`;
+    responseText = `I'm sending an immediate priority message to Sarah right now to let her know to check in on you, ${state.userName}. Please sit down comfortably and take slow, easy breaths. Help is on the way.`;
     recordSpokenPhrase(responseText);
     return {
       text: responseText,
@@ -685,6 +708,162 @@ async function executeAgentConversation({
     const scheduleData = mcpGetDailySchedule('all');
     const scheduleLog = recordMcpCall('get_daily_schedule', { category: 'all' }, scheduleData);
     toolCallsExecuted.push(scheduleLog);
+  }
+
+  // 1. Primary AI Brain: Gemini 3.8 Flash (High intelligence, warm companion persona, answers all day-to-day questions)
+  const gemini = getGeminiClient();
+  if (gemini) {
+    try {
+      const activeSensorsDesc = state.sensors
+        .slice(0, 10)
+        .map((s) => `${s.name} (${s.room}): ${s.state}`)
+        .join(', ');
+      const upcomingScheduleDesc = state.schedule
+        .map((s) => `${s.time} - ${s.title} (${s.isCompleted ? 'Completed' : 'Pending'})`)
+        .join(', ');
+
+      const systemInstruction = `You are CareContext, the compassionate, attentive, wise, and warm Alexa+ Elder Care Companion for ${state.userName} (age ${state.userAge}), living independently at ${state.homeAddress}. Her primary caregiver and daughter is ${state.caregiverName} (${state.caregiverPhone}).
+
+Home Environment & Context:
+- Current Time: ${getEffectiveTime()}, Date: ${getEffectiveDate()}
+- Eleanor's Current Room: ${state.currentRoom}
+- Estimated Wake Time Today: ${state.wakeTimeEstimated} (Typical routine: ${state.routineBaselineWake})
+- Active Ring Sensors: ${activeSensorsDesc}
+- Daily Schedule: ${upcomingScheduleDesc}
+- Safety State: ${state.safetyState}
+
+Capabilities & Core Mission:
+You excel at speaking with older adults and answering ANY day-to-day question effortlessly, including:
+1. Day-to-Day Life & Practical Knowledge: Weather & what to wear, cooking & simple nutritious recipes, how to boil eggs or make tea/coffee, gardening & houseplant care, gentle stretches & balance, hydration, pets, stain removal, household organization.
+2. Companionship & Mental Engagement: Friendly chit-chat, nostalgic stories, poems, lighthearted clean jokes, trivia, word games, listening empathetically when they feel lonely or bored.
+3. Home & Health Context: Checking whether the front door/windows are locked, reviewing doctor appointments (Dr. Evans) or medication times (Lisinopril), or noting home movement.
+4. Voice & Tone: Speak warmly, clearly, with respect and kindness. Keep answers concise for an Alexa smart speaker (2-4 spoken sentences; if a recipe or exercise is requested, give 3-4 clear step-by-step points). Avoid robotic or repetitive boilerplate.
+5. Safety: If ${state.userName} mentions falling, pain, severe dizziness, or an emergency, immediately express gentle concern, ask if they need help or if they'd like you to contact ${state.caregiverName}.
+
+Return your response strictly as valid JSON with the following structure:
+{
+  "text": "The clear spoken response for Alexa to read out loud to ${state.userName}",
+  "thought": "Brief internal caregiving context / MCP reasoning chain (for the caregiver inspector)",
+  "suggestedReplies": ["3 short (2-5 word) quick reply options for ${state.userName}"],
+  "mcpTool": "optional: 'get_ring_sensor_data' | 'get_daily_schedule' | 'alert_family_contact' | 'none'"
+}`;
+
+      let userPrompt = '';
+      if (triggerType === 'morning_checkin') {
+        userPrompt = `[Trigger: Morning Check-in]. Current room: ${state.currentRoom}. Wake time: ${state.wakeTimeEstimated}. Greet ${state.userName} warmly, reference the morning start in the ${state.currentRoom}, and remind her about a glass of water and her routine.`;
+      } else if (message) {
+        userPrompt = `${state.userName} says: "${message}". Please answer her question helpfully, accurately, and warmly.`;
+      } else {
+        userPrompt = `Good morning check-in for ${state.userName}.`;
+      }
+
+      // Build conversation history contents
+      const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+      if (history && Array.isArray(history)) {
+        for (const item of history.slice(-8)) {
+          contents.push({
+            role: item.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: item.content }],
+          });
+        }
+      }
+      contents.push({
+        role: 'user',
+        parts: [{ text: userPrompt }],
+      });
+
+      const candidateModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
+      let geminiResponse: any = null;
+      let usedModel = '';
+
+      for (const modelName of candidateModels) {
+        try {
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout for ${modelName}`)), 4500)
+          );
+
+          const res = await Promise.race([
+            gemini.models.generateContent({
+              model: modelName,
+              contents,
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                temperature: 0.7,
+              },
+            }),
+            timeoutPromise,
+          ]);
+
+          if (res && res.text) {
+            geminiResponse = res;
+            usedModel = modelName;
+            break;
+          }
+        } catch (mErr: any) {
+          console.warn(`Gemini model ${modelName} failed or quota reached (${mErr.message?.slice(0, 90)}), trying fallback candidate...`);
+        }
+      }
+
+      if (geminiResponse) {
+        const responseBody = geminiResponse.text?.trim() || '';
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(responseBody);
+        } catch {
+          const cleaned = responseBody.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+          try {
+            parsed = JSON.parse(cleaned);
+          } catch {
+            parsed = { text: responseBody };
+          }
+        }
+
+        if (parsed && parsed.text) {
+          responseText = parsed.text;
+          const modelBadge = usedModel === 'gemini-3.8-flash' ? 'Gemini 3.8 Flash' : `Gemini AI (${usedModel})`;
+          thought = parsed.thought
+            ? `${parsed.thought} [Powered by Google ${modelBadge}]`
+            : `Reasoning formulated via ${modelBadge} with live Ring home telemetry.`;
+          dynamicReplies = Array.isArray(parsed.suggestedReplies) && parsed.suggestedReplies.length > 0
+            ? parsed.suggestedReplies
+            : generateContextualReplies(responseText, nextSafetyState, message);
+
+          // Handle MCP tool invocation if indicated or relevant
+          const lowerMsg = (message || '').toLowerCase();
+          if (parsed.mcpTool === 'get_ring_sensor_data' || lowerMsg.includes('door') || lowerMsg.includes('sensor') || lowerMsg.includes('window') || lowerMsg.includes('lock')) {
+            const sensorData = mcpGetRingSensorData(6);
+            toolCallsExecuted.push(recordMcpCall('get_ring_sensor_data', { hours: 6 }, sensorData));
+          } else if (parsed.mcpTool === 'get_daily_schedule' || lowerMsg.includes('schedule') || lowerMsg.includes('appointment') || lowerMsg.includes('medicine') || lowerMsg.includes('pill')) {
+            const schedData = mcpGetDailySchedule('all');
+            toolCallsExecuted.push(recordMcpCall('get_daily_schedule', { category: 'all' }, schedData));
+          }
+
+          if (
+            responseText.toLowerCase().includes('are you hurt') ||
+            responseText.toLowerCase().includes('need me to call') ||
+            responseText.toLowerCase().includes('are you feeling okay')
+          ) {
+            nextSafetyState = 'verifying_safety';
+          }
+
+          state.safetyState = nextSafetyState;
+          recordSpokenPhrase(responseText);
+
+          return {
+            text: responseText,
+            thought,
+            toolCalls: toolCallsExecuted,
+            safetyState: nextSafetyState,
+            suggestedReplies: dynamicReplies,
+            aiModel: usedModel,
+            aiConnected: true,
+          };
+        }
+      }
+    } catch (geminiErr) {
+      console.warn('Gemini invocation error, falling back to Bedrock/rules:', geminiErr);
+    }
   }
 
   // Attempt Amazon Bedrock Converse API call if client is configured
@@ -995,14 +1174,14 @@ async function executeAgentConversation({
       dynamicReplies = ['What is on my schedule today?', 'What time is it?', 'Tell me a joke'];
     }
 
-    // 2. Front Door & Home Security Questions
+    // 2. Front Door, Windows & Home Security Questions
     else if (
-      lower.includes('front door') ||
-      lower.includes('door locked') ||
-      lower.includes('lock the door') ||
-      lower.includes('door closed') ||
-      lower.includes('anyone at the door') ||
-      lower.includes('security')
+      lower.includes('door') ||
+      lower.includes('window') ||
+      lower.includes('lock') ||
+      lower.includes('security') ||
+      lower.includes('anyone outside') ||
+      lower.includes('anyone at the door')
     ) {
       const sensorData = mcpGetRingSensorData(6);
       const toolLog = recordMcpCall('get_ring_sensor_data', { hours: 6 }, sensorData);
@@ -1021,16 +1200,11 @@ async function executeAgentConversation({
       dynamicReplies = ['Thank you, that makes me feel better', 'Did anyone ring the bell?', 'What else is on my schedule?'];
     }
 
-    // 3. Kitchen, Fridge, Food & Meals
+    // 3. Kitchen, Fridge & In-Home Food Sensor History
     else if (
-      lower.includes('fridge') ||
-      lower.includes('refrigerator') ||
-      lower.includes('breakfast') ||
-      lower.includes('what did i eat') ||
-      lower.includes('did i eat') ||
-      lower.includes('kitchen') ||
-      lower.includes('tea') ||
-      lower.includes('coffee')
+      (lower.includes('fridge') || lower.includes('refrigerator') || lower.includes('what did i eat') || lower.includes('did i eat')) ||
+      (lower.includes('kitchen') && !lower.includes('recipe') && !lower.includes('cook') && !lower.includes('egg') && !lower.includes('soup') && !lower.includes('oatmeal')) ||
+      (lower.includes('breakfast') && !lower.includes('egg') && !lower.includes('recipe') && !lower.includes('cook') && !lower.includes('oatmeal') && !lower.includes('how'))
     ) {
       const sensorData = mcpGetRingSensorData(6);
       const toolLog = recordMcpCall('get_ring_sensor_data', { hours: 6 }, sensorData);
@@ -1138,9 +1312,9 @@ async function executeAgentConversation({
       dynamicReplies = ['How much water should I drink?', 'What is on my schedule next?', 'Tell me something uplifting'];
     }
 
-    // 8. Hydration & Water Questions
+    // 8. Hydration & Drinking Water Questions
     else if (
-      lower.includes('water') ||
+      (lower.includes('water') && !lower.includes('plant') && !lower.includes('orchid') && !lower.includes('flower') && !lower.includes('garden')) ||
       lower.includes('hydration') ||
       lower.includes('thirsty') ||
       lower.includes('drink')
@@ -1185,12 +1359,10 @@ async function executeAgentConversation({
 
     // 10. Physical Therapy / Garden Walk
     else if (
-      lower.includes('walk') ||
-      lower.includes('exercise') ||
-      lower.includes('patio') ||
+      lower.includes('patio walk') ||
       lower.includes('physical therapy') ||
       lower.includes('mark') ||
-      lower.includes('stretches')
+      (lower.includes('walk') && !lower.includes('stretch') && !lower.includes('knee') && !lower.includes('stiff'))
     ) {
       const schedData = mcpGetDailySchedule('activity');
       const toolLog = recordMcpCall('get_daily_schedule', { category: 'activity' }, schedData);
@@ -1258,7 +1430,9 @@ async function executeAgentConversation({
       lower.includes('what day') ||
       lower.includes('what date') ||
       lower.includes('clock') ||
-      lower.includes('today')
+      lower.includes('what is the date') ||
+      lower === 'today' ||
+      lower.includes('day is today')
     ) {
       const curTime = getEffectiveTime();
       const curDate = getEffectiveDate();
@@ -1402,6 +1576,179 @@ async function executeAgentConversation({
       dynamicReplies = ['What should I do next?', 'Tell me a joke', "I'm going to relax now"];
     }
 
+    // 21. Cooking, Simple Recipes & Everyday Food Preparation
+    else if (
+      lower.includes('boil egg') ||
+      lower.includes('boiling egg') ||
+      lower.includes('boiled egg') ||
+      lower.includes('recipe') ||
+      lower.includes('cook') ||
+      lower.includes('soup') ||
+      lower.includes('lunch idea') ||
+      lower.includes('dinner idea') ||
+      lower.includes('easy meal') ||
+      lower.includes('oatmeal') ||
+      lower.includes('salad') ||
+      lower.includes('toast')
+    ) {
+      thought = `User asked for a day-to-day cooking guide, recipe, or kitchen tip.`;
+      if (lower.includes('egg')) {
+        responseText = `For perfect hard-boiled eggs, ${state.userName}: place the eggs in a pot and cover them with cool water by one inch. Bring to a rolling boil, then turn off the heat, cover with a lid, and let them sit for 10 to 12 minutes. Transfer to cold water to cool, and they will peel effortlessly!`;
+        dynamicReplies = ['How about an easy soup?', 'What else is good for lunch?', 'Check my kitchen motion'];
+      } else if (lower.includes('soup')) {
+        responseText = `A heartwarming, easy chicken or vegetable broth soup is wonderful, ${state.userName}! Simmer low-sodium broth with sliced carrots, celery, and a pinch of thyme or parsley for 15 minutes. Add soft shredded chicken or soft noodles, and you have a warm, comforting meal that's very gentle on the stomach.`;
+        dynamicReplies = ['Can you remind me at lunch time?', 'What is on my schedule?', 'Tell me a joke'];
+      } else if (lower.includes('oatmeal')) {
+        responseText = `Warm oatmeal is fantastic for heart health, ${state.userName}. Cook rolled oats with water or milk on the stove for about 5 minutes until creamy. Top it with a drizzle of honey, a dash of cinnamon, and a few fresh blueberries or sliced banana!`;
+        dynamicReplies = ['I will make that tomorrow', 'Check front door', 'Tell me a story'];
+      } else {
+        responseText = `For an easy, nutritious meal today, ${state.userName}, how about a warm toasted English muffin with soft scrambled eggs and avocado, or a bowl of vegetable soup with whole-grain crackers? They take under ten minutes and give you great steady energy!`;
+        dynamicReplies = ['How long to boil eggs?', 'Check my schedule', 'Tell me a joke'];
+      }
+    }
+
+    // 22. Gardening, Houseplants & Floral Care
+    else if (
+      lower.includes('plant') ||
+      lower.includes('orchid') ||
+      lower.includes('flower') ||
+      lower.includes('garden') ||
+      lower.includes('watering') ||
+      lower.includes('water my') ||
+      lower.includes('tomato') ||
+      lower.includes('succulent') ||
+      lower.includes('yellow leaves') ||
+      lower.includes('soil')
+    ) {
+      thought = `User asked about gardening or indoor houseplant care.`;
+      if (lower.includes('orchid')) {
+        responseText = `Orchids love gentle care, ${state.userName}! Water them about once a week by letting lukewarm water run through the bark medium and drain completely, or place three ice cubes at the base once a week. Keep them in bright, indirect light away from cold drafts.`;
+        dynamicReplies = ['Why are my leaves yellow?', 'How about outdoor tomatoes?', 'Tell me a joke'];
+      } else if (lower.includes('yellow')) {
+        responseText = `Yellow leaves usually mean the plant is getting a bit too much water or the roots are sitting in soggy soil, ${state.userName}. Check if the top inch of soil is dry to the touch before watering again, and ensure the drainage hole isn't blocked.`;
+        dynamicReplies = ['How often should I water?', 'What is on my schedule?', 'Tell me a story'];
+      } else {
+        responseText = `For most indoor houseplants like peace lilies and pothos, ${state.userName}, water only when the top inch of soil feels dry to your fingertip. Giving them soft morning light and wiping dust off their leaves helps them breathe and stay vibrant green!`;
+        dynamicReplies = ['How about orchids?', 'Check patio door sensor', 'Tell me a gentle story'];
+      }
+    }
+
+    // 23. Gentle Senior Exercises, Mobility & Health Habits
+    else if (
+      lower.includes('stretch') ||
+      lower.includes('exercise') ||
+      lower.includes('knee') ||
+      lower.includes('stiff') ||
+      lower.includes('joint') ||
+      lower.includes('arthritis') ||
+      lower.includes('balance') ||
+      lower.includes('sleep better') ||
+      lower.includes('insomnia')
+    ) {
+      thought = `User asked about gentle senior exercises, easing stiffness, or sleep habits.`;
+      if (lower.includes('knee') || lower.includes('stiff')) {
+        responseText = `For gentle morning stiffness, ${state.userName}, try seated leg extensions while sitting tall in a sturdy chair: slowly straighten one leg out, hold for 3 seconds, and gently lower it. Doing 5 on each side helps circulate joint fluid without putting weight on your knees.`;
+        dynamicReplies = ['What about calf stretches?', 'When is my Dr. Evans call?', 'Tell me a joke'];
+      } else if (lower.includes('sleep') || lower.includes('insomnia')) {
+        responseText = `For a deeper, more peaceful sleep, ${state.userName}: keep the bedroom cool around 67°F, avoid screens or bright lights 30 minutes before bed, and try a warm cup of caffeine-free chamomile tea. Soft breathing—inhaling for 4 counts and exhaling for 4 counts—also calms the mind.`;
+        dynamicReplies = ['Play soothing classical music', 'What time is it now?', 'Check my front door'];
+      } else {
+        responseText = `Three wonderful gentle stretches for today, ${state.userName}: 1) Gentle neck tilts from side to side, 2) Seated shoulder rolls backward, and 3) Ankle circles to keep your feet limber. Take slow, relaxed breaths while doing each one!`;
+        dynamicReplies = ['That feels good', 'When is my patio walk?', 'Tell me a joke'];
+      }
+    }
+
+    // 24. Day-to-Day Household & Practical Life Tips
+    else if (
+      lower.includes('stain') ||
+      lower.includes('clean') ||
+      lower.includes('stove') ||
+      lower.includes('smoke detector') ||
+      lower.includes('appliance') ||
+      lower.includes('glasses') ||
+      lower.includes('laundry')
+    ) {
+      thought = `User asked for a practical household tip or safety advice.`;
+      if (lower.includes('stain')) {
+        responseText = `For coffee or tea stains on fabric or mugs, ${state.userName}: a paste of baking soda and a splash of warm water works miracles gently without harsh chemicals. Rub it softly with a cloth and rinse with warm water!`;
+        dynamicReplies = ['What an easy tip!', 'Check my front door', 'What time is it?'];
+      } else {
+        responseText = `A great tip for household safety, ${state.userName}: keep walkways clear of loose rugs or cords, ensure high-traffic areas have good lighting, and double-check that kitchen burners are fully in the off position after cooking. Your Ring sensors help monitor home safety all day long!`;
+        dynamicReplies = ['Are all doors locked?', 'What is on my schedule?', 'Tell me a joke'];
+      }
+    }
+
+    // 25. Trivia, Curiosities, Riddles & Mental Sharpness
+    else if (
+      lower.includes('trivia') ||
+      lower.includes('riddle') ||
+      lower.includes('fact') ||
+      lower.includes('curiosity') ||
+      lower.includes('history') ||
+      lower.includes('poem')
+    ) {
+      thought = `User requested mental engagement, trivia, riddle, or an interesting fact.`;
+      if (lower.includes('riddle')) {
+        responseText = `Here is a fun riddle for you, ${state.userName}: What has hands and a face, but cannot smile or hug you? ... A clock! It keeps our daily schedule running smoothly every single day.`;
+        dynamicReplies = ['Tell me another riddle!', 'Give me a trivia fact', 'Tell me a joke'];
+      } else if (lower.includes('trivia') || lower.includes('fact')) {
+        const facts = [
+          `Did you know, ${state.userName}? Honey found in ancient Egyptian tombs that is over 3,000 years old is still completely edible! Natural honey has almost no moisture and high acidity, making it naturally preserve forever.`,
+          `Here is an interesting fact, ${state.userName}: Hummingbirds are the only birds on Earth capable of flying backward and upside down! Their wings beat up to 80 times per second.`,
+          `Did you know, ${state.userName}? Bananas naturally grow curved because they reach upward toward the sun against gravity, a process botanists call negative geotropism!`,
+        ];
+        responseText = facts.find((f) => !hasSpokenRecently(f)) || facts[0];
+        dynamicReplies = ['Tell me another fact!', 'Tell me a riddle', 'What is on my schedule?'];
+      } else {
+        responseText = `Here is a classic uplifting verse for your day, ${state.userName}: "Hope is the thing with feathers / That perches in the soul / And sings the tune without the words / And never stops at all." Written by Emily Dickinson.`;
+        dynamicReplies = ['That was lovely', 'Tell me a trivia fact', 'Tell me a joke'];
+      }
+    }
+
+    // 26. Pets & Animals
+    else if (
+      lower.includes('dog') ||
+      lower.includes('cat') ||
+      lower.includes('pet') ||
+      lower.includes('bird')
+    ) {
+      thought = `User asked about companion animals, pets, or birdwatching.`;
+      responseText = `Animals bring so much unconditional warmth and joy to a home, ${state.userName}! Watching the birds outside by the patio feeder or having a gentle pet to stroke naturally lowers blood pressure and boosts serotonin. Do you have a favorite kind of pet?`;
+      dynamicReplies = ['I love dogs', 'I love cats', 'Tell me about the patio birds'];
+    }
+
+    // 27. Alexa Capabilities & Assistance
+    else if (
+      lower.includes('what can you do') ||
+      lower.includes('what can i ask') ||
+      lower.includes('help') ||
+      lower.includes('features') ||
+      lower.includes('commands')
+    ) {
+      thought = `User asked about CareContext Alexa companion capabilities.`;
+      responseText = `I'm your all-in-one companion, ${state.userName}! You can ask me everyday questions like recipes, boiling eggs, weather, gardening, gentle stretches, jokes, or trivia. I also watch over your Ring door sensors, track your schedule, remind you of your medicine, and can alert your daughter ${state.caregiverName} whenever you need help!`;
+      dynamicReplies = ['What is on my schedule today?', 'How do I boil eggs?', 'Tell me a joke'];
+    }
+
+    // 28. Friendly Greetings & Goodnight
+    else if (
+      lower.includes('good morning') ||
+      lower.includes('good afternoon') ||
+      lower.includes('good evening') ||
+      lower.includes('good night') ||
+      lower.includes('goodnight') ||
+      lower.includes('how are you')
+    ) {
+      thought = `User gave a warm polite everyday greeting.`;
+      if (lower.includes('goodnight') || lower.includes('good night')) {
+        responseText = `Goodnight, ${state.userName}. Sleep peacefully and deeply. I will keep an eye on your home's doors and sensors all night long so you can rest with total peace of mind. Sweet dreams!`;
+        dynamicReplies = ['Goodnight CareContext', 'Check front door once more', 'Thank you'];
+      } else {
+        responseText = `A very warm hello to you, ${state.userName}! I am doing wonderfully, thank you for asking. Everything in your home is calm, safe, and pleasant. How can I brighten your day right now?`;
+        dynamicReplies = ['What is on my schedule?', 'Tell me a joke', 'What is the weather today?'];
+      }
+    }
+
     // 21. Dynamic Conversational Responder (Catch-All Anti-Repetition)
     else {
       thought = `Contextual open conversational query on "${raw}". Formulating engaging, non-repetitive elder companion reply.`;
@@ -1495,26 +1842,88 @@ app.post('/api/schedule/toggle', (req, res) => {
   res.json(state);
 });
 
-app.post('/api/sensors/trigger', (req, res) => {
-  const { sensorId, eventType, detail } = req.body;
-  const sensor = state.sensors.find((s) => s.id === sensorId);
-  if (sensor) {
-    sensor.state = eventType.includes('open') ? 'open' : 'active';
-    sensor.lastTriggered = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-    sensor.relativeMinutesAgo = 0;
-    state.events.push({
-      id: `ev-${Date.now()}`,
-      sensorId: sensor.id,
-      room: sensor.room,
-      deviceName: sensor.name,
-      eventType,
-      timestamp: sensor.lastTriggered,
-      detail: detail || `Sensor event on ${sensor.name}`,
-    });
-    if (sensor.room) {
-      state.currentRoom = sensor.room;
-    }
+app.post('/api/floorplan', (req, res) => {
+  const { floorPlanId, level } = req.body;
+  if (floorPlanId) {
+    (state as any).floorPlanId = floorPlanId;
+    if (level) (state as any).activeFloorLevel = level;
   }
+  res.json(state);
+});
+
+app.post('/api/sensors/trigger', (req, res) => {
+  const { sensorId, eventType, detail, sensorName, room } = req.body;
+  let sensor = state.sensors.find((s) => s.id === sensorId);
+  const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  let newState: any = 'active';
+  if (eventType === 'motion_cleared') newState = 'clear';
+  else if (eventType === 'door_opened' || eventType === 'window_opened') newState = 'open';
+  else if (eventType === 'door_closed' || eventType === 'window_closed') newState = 'closed';
+  else if (eventType === 'water_leak') newState = 'leak_detected';
+  else if (eventType === 'water_cleared') newState = 'safe';
+  else if (eventType === 'glass_break') newState = 'alert';
+  else if (eventType === 'pill_taken') newState = 'closed';
+
+  if (sensor) {
+    sensor.state = newState;
+    sensor.lastTriggered = timeStr;
+    sensor.relativeMinutesAgo = 0;
+  } else {
+    sensor = {
+      id: sensorId,
+      name: sensorName || sensorId,
+      room: (room as any) || 'Living Room',
+      type: eventType.includes('door') ? 'door_contact' : 'motion',
+      state: newState,
+      battery: 98,
+      lastTriggered: timeStr,
+      relativeMinutesAgo: 0,
+      description: detail || 'Simulated smart sensor',
+    };
+    state.sensors.push(sensor);
+  }
+
+  state.events.unshift({
+    id: `ev-${Date.now()}`,
+    sensorId: sensor.id,
+    room: sensor.room,
+    deviceName: sensor.name,
+    eventType: eventType as any,
+    timestamp: timeStr,
+    detail: detail || `Sensor event on ${sensor.name}`,
+  });
+  if (sensor.room) {
+    state.currentRoom = sensor.room;
+  }
+
+  if (sensorId.includes('med') || eventType === 'pill_taken') {
+    state.schedule.forEach((item) => {
+      if (item.category === 'medication') {
+        item.isCompleted = true;
+        item.completedAt = timeStr;
+      }
+    });
+  }
+
+  if (eventType === 'water_leak') {
+    state.alerts.unshift({
+      id: `alert-${Date.now()}`,
+      timestamp: timeStr,
+      severity: 'urgent',
+      reason: `Water Leak Alert: ${sensor.name}`,
+      details: `Moisture detected by ${sensor.name} in ${sensor.room} at ${timeStr}. Check water supply valve.`,
+      recipient: {
+        name: state.caregiverName || 'Sarah Miller',
+        relationship: 'Daughter / Primary Caregiver',
+        phone: state.caregiverPhone || '+1 (555) 234-8901',
+        channel: 'SMS Priority Gateway & Alexa Intercom',
+      },
+      status: 'Sent',
+      sensorSnapshot: `Location: ${state.currentRoom} | Last Sensor: ${sensor.name}`,
+    });
+  }
+
   res.json(state);
 });
 
@@ -1624,6 +2033,17 @@ app.post('/api/schedule/delete', (req, res) => {
     recordMcpCall('get_daily_schedule', { action: 'delete_item', itemId }, mcpGetDailySchedule('all'));
   }
   res.json(state);
+});
+
+app.get('/api/gemini/status', (req, res) => {
+  const hasKey = !!process.env.GEMINI_API_KEY;
+  res.json({
+    connected: hasKey,
+    apiKeyConfigured: hasKey,
+    preferredModel: 'gemini-3.8-flash',
+    activeModels: ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'],
+    status: hasKey ? 'online' : 'offline',
+  });
 });
 
 app.post('/api/mcp/chat', async (req, res) => {

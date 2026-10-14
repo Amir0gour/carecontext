@@ -1,13 +1,29 @@
+export type RoomType =
+  | 'Bedroom'
+  | 'Bathroom'
+  | 'Kitchen'
+  | 'Living Room'
+  | 'Front Entry'
+  | 'Patio & Garden'
+  | 'Hallway'
+  | 'Second Floor Suite'
+  | 'Stairway'
+  | 'Garage'
+  | 'Guest Bedroom'
+  | string;
+
 export interface RingSensor {
   id: string;
   name: string;
-  room: 'Bedroom' | 'Bathroom' | 'Kitchen' | 'Living Room' | 'Front Entry';
-  type: 'motion' | 'door_contact' | 'pressure';
-  state: 'active' | 'clear' | 'open' | 'closed';
+  room: RoomType;
+  level?: 'Ground Floor' | 'Second Floor' | 'Single Level';
+  type: 'motion' | 'door_contact' | 'pressure' | 'water_freeze' | 'glass_break' | 'doorbell' | 'window_contact';
+  state: 'active' | 'clear' | 'open' | 'closed' | 'leak_detected' | 'safe' | 'alert';
   battery: number;
   lastTriggered: string;
   relativeMinutesAgo: number;
   description: string;
+  floorPlanId?: string;
 }
 
 export interface SensorEvent {
@@ -15,9 +31,42 @@ export interface SensorEvent {
   sensorId: string;
   room: string;
   deviceName: string;
-  eventType: 'motion_detected' | 'motion_cleared' | 'door_opened' | 'door_closed' | 'bed_exit';
+  eventType:
+    | 'motion_detected'
+    | 'motion_cleared'
+    | 'door_opened'
+    | 'door_closed'
+    | 'bed_exit'
+    | 'water_leak'
+    | 'water_cleared'
+    | 'doorbell_ring'
+    | 'glass_break'
+    | 'pill_taken'
+    | 'window_opened'
+    | 'window_closed';
   timestamp: string;
   detail: string;
+}
+
+export type FloorPlanId = 'ranch_single_story' | 'townhouse_two_story' | 'compact_suite';
+
+export interface FloorPlanRoom {
+  id: string;
+  name: string;
+  level: string;
+  dimensions?: string;
+  description: string;
+  sensorIds: string[];
+}
+
+export interface FloorPlanConfig {
+  id: FloorPlanId;
+  name: string;
+  tagline: string;
+  description: string;
+  levels: string[];
+  defaultRoom: string;
+  rooms: FloorPlanRoom[];
 }
 
 export interface ScheduleItem {
@@ -94,4 +143,7 @@ export interface HomeState {
   alerts: CaregiverAlert[];
   mcpLogs: McpToolCall[];
   safetyState: 'normal' | 'verifying_safety' | 'emergency_dispatched';
+  floorPlanId?: FloorPlanId;
+  activeFloorLevel?: string;
 }
+

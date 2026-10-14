@@ -17,10 +17,77 @@ import {
   PhoneCall,
   User,
   Clock,
+  Sun,
+  Utensils,
+  Sprout,
+  Activity,
+  BookOpen,
+  MessageSquare,
+  HelpCircle,
 } from 'lucide-react';
 import { AlexaLightRing } from './AlexaLightRing.tsx';
 import type { AgentChatMessage, HomeState } from '../types/careContext.ts';
-import { playAlexaChime, playEmergencyAlertChime, speakText, stopSpeaking } from '../utils/audio.ts';
+import { playAlexaChime, playEmergencyAlertChime, speakText, stopSpeaking, getCurrentVoiceLabel } from '../utils/audio.ts';
+
+const DAY_TO_DAY_PRESETS = [
+  {
+    id: 'weather',
+    category: 'Weather & Outfit',
+    icon: Sun,
+    questions: [
+      'How is the weather outside today?',
+      'Do I need a warm jacket or cardigan today?',
+    ],
+  },
+  {
+    id: 'cooking',
+    category: 'Cooking & Recipes',
+    icon: Utensils,
+    questions: [
+      'How long should I boil eggs for breakfast?',
+      'What is an easy, comforting soup recipe for lunch?',
+      'How do I make warm oatmeal with fruit?',
+    ],
+  },
+  {
+    id: 'plants',
+    category: 'Plants & Gardening',
+    icon: Sprout,
+    questions: [
+      'How often should I water my orchids and houseplants?',
+      'Why are some of my plant leaves turning yellow?',
+    ],
+  },
+  {
+    id: 'health',
+    category: 'Gentle Stretches & Health',
+    icon: Activity,
+    questions: [
+      'What are 3 gentle morning stretches for seniors?',
+      'How can I ease morning knee stiffness while seated?',
+      'How can I get a deeper, more peaceful sleep at night?',
+    ],
+  },
+  {
+    id: 'trivia',
+    category: 'Stories, Trivia & Fun',
+    icon: BookOpen,
+    questions: [
+      'Tell me an interesting trivia fact to brighten my day',
+      'Give me a fun morning riddle to solve',
+      'Tell me a classic uplifting poem or story',
+    ],
+  },
+  {
+    id: 'home',
+    category: 'Home & Security',
+    icon: ShieldAlert,
+    questions: [
+      'Are all the doors and windows securely locked right now?',
+      'Did anyone come by the front porch doorbell today?',
+    ],
+  },
+];
 
 interface AlexaDisplayProps {
   homeState: HomeState;
@@ -29,7 +96,8 @@ interface AlexaDisplayProps {
   onSendMessage: (text: string) => void;
   onMorningCheckin: () => void;
   onSafetyResponse: (answer: 'yes' | 'no') => void;
-  onUnresponsiveTimeout: () => void;
+  onUnresponsiveTimeout?: () => void;
+  onEmergencySOS?: () => void;
   onResetSession: () => void;
   suggestedReplies: string[];
   onOpenProfileModal?: () => void;
@@ -43,6 +111,7 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
   onMorningCheckin,
   onSafetyResponse,
   onUnresponsiveTimeout,
+  onEmergencySOS,
   onResetSession,
   suggestedReplies,
   onOpenProfileModal,
@@ -52,7 +121,8 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
   const [isListening, setIsListening] = useState(false);
   const [seniorFontMode, setSeniorFontMode] = useState(true);
   const [inputMessage, setInputMessage] = useState('');
-  const [countdown, setCountdown] = useState<number | null>(null);
+  const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [showDayToDayBar, setShowDayToDayBar] = useState<boolean>(true);
 
   // Real-Time live ticking clock
   const [liveClock, setLiveClock] = useState(() =>
@@ -99,28 +169,12 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
     }
   }, [homeState.safetyState]);
 
-  // Handle 30s safety verification countdown
+  // Play alert chime when entering safety verification (without forced auto-dispatch timeout)
   useEffect(() => {
     if (homeState.safetyState === 'verifying_safety') {
-      setCountdown(30);
       playEmergencyAlertChime();
-    } else {
-      setCountdown(null);
     }
   }, [homeState.safetyState]);
-
-  useEffect(() => {
-    if (countdown === null) return;
-    if (countdown <= 0) {
-      setCountdown(null);
-      onUnresponsiveTimeout();
-      return;
-    }
-    const timer = setInterval(() => {
-      setCountdown((prev) => (prev !== null ? prev - 1 : null));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [countdown, onUnresponsiveTimeout]);
 
   // Setup Web Speech API for real voice recognition
   useEffect(() => {
@@ -205,6 +259,10 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 MCP Active
               </span>
+              <span className="text-[11px] font-medium bg-amber-950/80 text-amber-300 border border-amber-800/50 px-2 py-0.5 rounded-full flex items-center gap-1 shadow-sm">
+                <Sparkles className="w-3 h-3 text-amber-400 animate-pulse" />
+                <span>Gemini AI Connected</span>
+              </span>
             </div>
             <div className="text-xs text-stone-400 flex items-center gap-2">
               <span className="flex items-center gap-1.5">
@@ -225,8 +283,31 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
           </div>
         </div>
 
-        {/* Accessibility & Audio Controls */}
+        {/* Accessibility, Voice Indicator & Audio Controls */}
         <div className="flex items-center gap-2">
+          {/* Emergency SOS Button */}
+          <button
+            type="button"
+            onClick={() => {
+              if (onEmergencySOS) onEmergencySOS();
+              else onSafetyResponse('no');
+            }}
+            className="px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-950/60 transition-all flex items-center gap-1.5 cursor-pointer active:scale-95"
+            title="Press to immediately alert caregiver and dispatch help"
+          >
+            <ShieldAlert className="w-3.5 h-3.5 text-white animate-pulse" />
+            <span>Emergency SOS</span>
+          </button>
+
+          {/* Voice Indicator showing unified female voice */}
+          <div
+            className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 text-[11px] text-cyan-300"
+            title={`Voice locked to single consistent voice: ${getCurrentVoiceLabel()}`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+            <span>Voice: Alexa (Consistent)</span>
+          </div>
+
           {/* Senior Text Size Toggle */}
           <button
             onClick={() => setSeniorFontMode(!seniorFontMode)}
@@ -346,41 +427,42 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
           {/* Emergency Safety Alert Priority Banner if in Safety Verification */}
           {homeState.safetyState === 'verifying_safety' && (
             <div className="bg-amber-950/90 border-b border-amber-600/40 p-4 animate-in slide-in-from-top duration-300">
-              <div className="flex items-start justify-between gap-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div className="flex items-start gap-3">
                   <div className="p-2 rounded-xl bg-amber-500/20 text-amber-300 border border-amber-500/40 shrink-0">
                     <AlertTriangle className="w-6 h-6 animate-pulse" />
                   </div>
                   <div>
                     <h3 className="font-bold text-amber-100 text-base flex items-center gap-2">
-                      <span>Safety Verification Protocol Active</span>
-                      {countdown !== null && (
-                        <span className="text-xs bg-amber-900 text-amber-300 px-2 py-0.5 rounded-full border border-amber-700">
-                          Auto-alert {homeState.caregiverName || 'Caregiver'} in {countdown}s
-                        </span>
-                      )}
+                      <span>Safety Verification Active</span>
+                      <span className="text-xs bg-amber-900/90 text-amber-300 px-2.5 py-0.5 rounded-full border border-amber-700/60 font-medium">
+                        No 30s Auto-Dispatch (Rest-Safe)
+                      </span>
                     </h3>
                     <p className="text-amber-200/90 text-sm mt-0.5">
-                      CareContext is checking if {homeState.userName} needs immediate help.
+                      Checking in on {homeState.userName}. If {homeState.userName} is resting, napping, or moving slowly, no emergency call will be forced.
                     </p>
                   </div>
                 </div>
 
-                {/* Big Accessible Yes / No Verification Buttons */}
+                {/* Big Accessible Yes / SOS Buttons */}
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => onSafetyResponse('yes')}
-                    className="px-4 py-2.5 rounded-xl font-bold text-sm bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg transition-all flex items-center gap-1.5"
+                    className="px-4 py-2.5 rounded-xl font-bold text-sm bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg transition-all flex items-center gap-1.5 cursor-pointer active:scale-95"
                   >
                     <CheckCircle2 className="w-4 h-4" />
-                    <span>Yes, I&apos;m Okay</span>
+                    <span>I&apos;m Okay / Resting</span>
                   </button>
                   <button
-                    onClick={() => onSafetyResponse('no')}
-                    className="px-4 py-2.5 rounded-xl font-bold text-sm bg-rose-600 hover:bg-rose-500 text-white shadow-lg transition-all flex items-center gap-1.5"
+                    onClick={() => {
+                      if (onEmergencySOS) onEmergencySOS();
+                      else onSafetyResponse('no');
+                    }}
+                    className="px-4 py-2.5 rounded-xl font-bold text-sm bg-rose-600 hover:bg-rose-500 text-white shadow-lg transition-all flex items-center gap-1.5 cursor-pointer active:scale-95"
                   >
                     <ShieldAlert className="w-4 h-4" />
-                    <span>No, Need Help!</span>
+                    <span>Emergency SOS</span>
                   </button>
                 </div>
               </div>
@@ -506,8 +588,11 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
                   {/* Internal Reasoning Insight */}
                   {msg.thought && (
                     <div className="mt-2 text-xs text-stone-400/90 italic bg-stone-900/60 p-2 rounded-lg border border-stone-800">
-                      <span className="font-semibold text-stone-300 not-italic mr-1">Context Analysis:</span>
-                      {msg.thought}
+                      <div className="flex items-center gap-1.5 font-semibold text-stone-300 not-italic mb-0.5">
+                        <Sparkles className="w-3 h-3 text-amber-400" />
+                        <span>AI Context & Reasoning:</span>
+                      </div>
+                      <div>{msg.thought}</div>
                     </div>
                   )}
                 </div>
@@ -539,10 +624,83 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Accessible Quick Response Buttons (Elderly-Friendly One-Tap) */}
+          {/* Day-to-Day Questions Explorer (One-Tap Topics & Prompts) */}
+          <div className="px-6 py-2 bg-stone-950/80 border-t border-stone-800/80">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-amber-300">
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                <span>Day-to-Day Questions (Tap to Ask Alexa):</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDayToDayBar(!showDayToDayBar)}
+                className="text-[10px] text-stone-400 hover:text-stone-200 transition-colors cursor-pointer"
+              >
+                {showDayToDayBar ? 'Collapse' : 'Show Topics'}
+              </button>
+            </div>
+
+            {showDayToDayBar && (
+              <div className="space-y-2">
+                {/* Topic Selector Chips */}
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCategory('all')}
+                    className={`px-2.5 py-1 rounded-full whitespace-nowrap transition-colors cursor-pointer font-medium ${
+                      selectedCategory === 'all'
+                        ? 'bg-amber-500 text-stone-950 font-semibold shadow-sm'
+                        : 'bg-stone-850 hover:bg-stone-800 text-stone-300 border border-stone-700/60'
+                    }`}
+                  >
+                    🌟 All Everyday Topics
+                  </button>
+                  {DAY_TO_DAY_PRESETS.map((preset) => {
+                    const Icon = preset.icon;
+                    const isSelected = selectedCategory === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => setSelectedCategory(preset.id)}
+                        className={`px-2.5 py-1 rounded-full whitespace-nowrap flex items-center gap-1 transition-colors cursor-pointer font-medium ${
+                          isSelected
+                            ? 'bg-cyan-500 text-stone-950 font-semibold shadow-sm'
+                            : 'bg-stone-850 hover:bg-stone-800 text-stone-300 border border-stone-700/60'
+                        }`}
+                      >
+                        <Icon className="w-3 h-3" />
+                        <span>{preset.category}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Day-to-Day One-Tap Questions */}
+                <div className="flex flex-wrap gap-1.5">
+                  {(selectedCategory === 'all'
+                    ? DAY_TO_DAY_PRESETS.flatMap((p) => p.questions.slice(0, 1))
+                    : DAY_TO_DAY_PRESETS.find((p) => p.id === selectedCategory)?.questions || []
+                  ).map((q, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => onSendMessage(q)}
+                      disabled={isThinking}
+                      className="px-2.5 py-1 rounded-lg text-xs font-medium bg-stone-800/90 hover:bg-stone-700 text-amber-200/95 border border-amber-500/25 hover:border-amber-400/50 transition-all flex items-center gap-1 disabled:opacity-50 cursor-pointer text-left"
+                    >
+                      <span>💬 {q}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Accessible Contextual Suggested Replies */}
           <div className="px-6 py-2 bg-stone-950/60 border-t border-stone-800/60">
             <div className="text-[11px] font-semibold text-stone-400 mb-1.5 flex items-center justify-between">
-              <span>Quick Replies (One-Tap for Eleanor):</span>
+              <span>Quick Context Replies:</span>
               <span className="text-stone-400">Click or use microphone below</span>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -551,7 +709,7 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
                   key={idx}
                   onClick={() => onSendMessage(reply)}
                   disabled={isThinking}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-700 hover:border-amber-500/40 transition-colors disabled:opacity-50"
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-700 hover:border-cyan-500/40 transition-colors disabled:opacity-50 cursor-pointer"
                 >
                   {reply}
                 </button>
@@ -564,6 +722,19 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
             onSubmit={handleSend}
             className="p-4 bg-stone-950/90 border-t border-stone-800 flex items-center gap-3"
           >
+            {/* Emergency SOS Button */}
+            <button
+              type="button"
+              onClick={() => {
+                if (onEmergencySOS) onEmergencySOS();
+                else onSafetyResponse('no');
+              }}
+              className="p-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white border border-rose-500 shadow-sm transition-all flex items-center justify-center shrink-0 cursor-pointer active:scale-95"
+              title="Immediate Emergency SOS Alert"
+            >
+              <ShieldAlert className="w-5 h-5 text-white animate-pulse" />
+            </button>
+
             {/* Microphone Button */}
             <button
               type="button"
@@ -583,7 +754,7 @@ export const AlexaDisplay: React.FC<AlexaDisplayProps> = ({
               type="text"
               value={inputMessage}
               onChange={(e) => setInputMessage(e.target.value)}
-              placeholder={isListening ? 'Listening to speech...' : 'Type Eleanor’s response or speak above...'}
+              placeholder={isListening ? 'Listening to speech...' : 'Ask anything: recipes, weather, plants, stretches, doors, or chit-chat...'}
               disabled={isThinking}
               className="flex-1 bg-stone-800/90 border border-stone-700 rounded-xl px-4 py-3 text-stone-100 placeholder:text-stone-400 text-sm focus:outline-none focus:border-amber-400 transition-colors"
             />

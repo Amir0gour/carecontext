@@ -28,6 +28,7 @@ import { McpInspector } from './components/McpInspector.tsx';
 import { UserProfileModal } from './components/UserProfileModal.tsx';
 import type {
   AgentChatMessage,
+  FloorPlanId,
   HomeState,
   McpToolCall,
   ScheduleItem,
@@ -38,6 +39,7 @@ import {
   saveClientHomeState,
   applyScenarioToState,
   applySensorTriggerToState,
+  applyFloorPlanToState,
   getEffectiveTime,
 } from './utils/clientState.ts';
 import { executeClientAgentConversation } from './utils/clientAgent.ts';
@@ -98,7 +100,7 @@ export default function App() {
   // Send message / invoke agent
   const sendAgentRequest = async (payload: {
     message?: string;
-    triggerType?: 'morning_checkin' | 'user_speech' | 'safety_response' | 'unresponsive_timeout';
+    triggerType?: 'morning_checkin' | 'user_speech' | 'safety_response' | 'unresponsive_timeout' | 'emergency_sos';
     safetyAnswer?: 'yes' | 'no';
   }) => {
     setIsThinking(true);
@@ -189,6 +191,10 @@ export default function App() {
     sendAgentRequest({ triggerType: 'unresponsive_timeout' });
   };
 
+  const handleEmergencySOS = () => {
+    sendAgentRequest({ triggerType: 'emergency_sos' });
+  };
+
   const handleSelectScenario = async (scenarioKey: string) => {
     // Optimistic / fallback client state
     const nextState = applyScenarioToState(homeState, scenarioKey);
@@ -228,6 +234,29 @@ export default function App() {
       }
     } catch (e) {
       // Backend unavailable, client state is already updated
+    }
+  };
+
+  const handleSelectFloorPlan = async (floorPlanId: FloorPlanId, level?: string) => {
+    const nextState = applyFloorPlanToState(homeState, floorPlanId, level);
+    setHomeState(nextState);
+
+    try {
+      const res = await fetch('/api/floorplan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ floorPlanId, level }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setHomeState((prev) => ({
+          ...prev,
+          floorPlanId: data.floorPlanId || floorPlanId,
+          activeFloorLevel: data.activeFloorLevel || level,
+        }));
+      }
+    } catch (e) {
+      // Offline fallback already updated client state
     }
   };
 
@@ -465,6 +494,28 @@ export default function App() {
               <span className="text-amber-300/90">{liveDate}</span>
             </div>
 
+            {/* Emergency SOS Quick Button */}
+            {homeState.safetyState === 'emergency_dispatched' ? (
+              <button
+                type="button"
+                onClick={() => handleSafetyResponse('yes')}
+                className="px-3 py-1 rounded-full bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-600 font-semibold text-xs flex items-center gap-1.5 transition-all cursor-pointer"
+                title="Reset emergency state and mark resident safe"
+              >
+                <span>Reset to Safe</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleEmergencySOS}
+                className="px-3 py-1 rounded-full bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-rose-950/60 active:scale-95 transition-all cursor-pointer"
+                title="Dispatch Immediate Emergency SOS to Caregiver"
+              >
+                <ShieldAlert className="w-3.5 h-3.5 text-white animate-pulse" />
+                <span>Emergency SOS</span>
+              </button>
+            )}
+
             {homeState.safetyState === 'emergency_dispatched' ? (
               <span className="bg-rose-950 text-rose-300 border border-rose-700/60 px-3 py-1 rounded-full font-semibold flex items-center gap-1.5 animate-pulse">
                 <ShieldAlert className="w-3.5 h-3.5" />
@@ -617,6 +668,7 @@ export default function App() {
               onMorningCheckin={handleMorningCheckin}
               onSafetyResponse={handleSafetyResponse}
               onUnresponsiveTimeout={handleUnresponsiveTimeout}
+              onEmergencySOS={handleEmergencySOS}
               onResetSession={handleResetSession}
               suggestedReplies={suggestedReplies}
               onOpenProfileModal={() => setIsProfileModalOpen(true)}
@@ -628,6 +680,7 @@ export default function App() {
               homeState={homeState}
               onSelectScenario={handleSelectScenario}
               onTriggerSensor={handleTriggerSensor}
+              onSelectFloorPlan={handleSelectFloorPlan}
             />
           )}
 
